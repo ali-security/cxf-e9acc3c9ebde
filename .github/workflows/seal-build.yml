@@ -1,0 +1,124 @@
+name: seal-build
+
+# Upstream Apache CXF 3.2.4 ships no GitHub Actions CI (it builds on ASF Jenkins).
+# This workflow follows BUILDING.txt: JDK 8 (cxf.jdk.version=1.8), Maven, `mvn install`
+# with the module's surefire suite. It builds cxf-core and runs its full test suite,
+# then runs the suites of the other modules whose code later CVE patches touch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suites"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: "-Xmx3g -XX:MaxMetaspaceSize=768m"
+      QA_SKIPS: >-
+        -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true
+        -Denforcer.skip=true -Danimal.sniffer.skip=true -Dmaven.source.skip=true
+        -Dgpg.skip=true -Drat.skip=true -Dinvoker.skip=true
+      TEST_FILTER: ${{ inputs.test-filter }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Install Maven 3.9.5
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.5/binaries/apache-maven-3.9.5-bin.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.9.5/bin" >> "$GITHUB_PATH"
+
+      - name: Versions
+        run: |
+          java -version
+          mvn -v
+
+      - name: Build cxf-core and run its test suite
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            FILTER_ARGS="-Dtest=$TEST_FILTER -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false"
+          else
+            FILTER_ARGS=""
+          fi
+          mvn -B -e --no-transfer-progress clean install -pl core -am \
+            -Djava.awt.headless=true $QA_SKIPS $FILTER_ARGS
+
+      # testutils is built from source: the cxf-testutils-3.2.4 jar on Central carries generated
+      # JAX-WS clients whose wsdlLocation is the release manager's absolute path (/Users/dkulp/...),
+      # which breaks the systests on any other machine.
+      - name: Test patched-path modules (testutils, aegis, jaxrs, rs-client, transports-http, ws-rm, tools)
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            FILTER_ARGS="-Dtest=$TEST_FILTER -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false"
+          else
+            FILTER_ARGS=""
+          fi
+          mvn -B -e --no-transfer-progress install \
+            -pl testutils,rt/databinding/aegis,rt/frontend/jaxrs,rt/rs/client,rt/transports/http,rt/ws/rm,tools/common,tools/wsdlto/databinding/jaxb,tools/wsdlto/test \
+            -Djava.awt.headless=true $QA_SKIPS $FILTER_ARGS
+
+      - name: Patched-path systests (JAXRSClientServerSpringBookTest, jaxws ClientServerTest)
+        run: |
+          TESTS="${TEST_FILTER:-JAXRSClientServerSpringBookTest,ClientServerTest}"
+          mvn -B -e --no-transfer-progress test -pl systests/jaxrs,systests/jaxws \
+            -Djava.awt.headless=true $QA_SKIPS \
+            -Dtest="$TESTS" -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Report skipped tests with reasons
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          total = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skipped = []
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              root = ET.parse(f).getroot()
+              for k in total:
+                  total[k] += int(root.get(k, 0))
+              module = f.split("/target/")[0]
+              for tc in root.iter("testcase"):
+                  sk = tc.find("skipped")
+                  if sk is None:
+                      continue
+                  cls, name = tc.get("classname"), tc.get("name")
+                  reason = sk.get("message") or ""
+                  src = os.path.join(module, "src/test/java", cls.replace(".", "/") + ".java")
+                  if not os.path.exists(src):
+                      hits = glob.glob("**/src/test/java/" + cls.replace(".", "/") + ".java", recursive=True)
+                      src = hits[0] if hits else src
+                  if not os.path.exists(src):
+                      reason = (reason + " (test source not found: " + src + ")").strip()
+                  else:
+                      lines = open(src, encoding="utf-8", errors="replace").read().splitlines()
+                      for i, line in enumerate(lines):
+                          if re.search(r"void\s+" + re.escape(name) + r"\s*\(", line):
+                              for back in lines[max(0, i - 8):i]:
+                                  if "Ignore" in back or "Assume" in back:
+                                      reason = (reason + " upstream annotation " + back.strip() + " in " + src).strip()
+                              body = "\n".join(lines[i:i + 15])
+                              m = re.search(r"assume\w*\([^;]*\);", body)
+                              if m:
+                                  reason = (reason + " " + m.group(0)).strip()
+                              break
+                  skipped.append((module, cls, name, reason or "no reason recorded"))
+          print("Surefire totals across all modules: tests=%(tests)d failures=%(failures)d errors=%(errors)d skipped=%(skipped)d" % total)
+          for module, cls, name, reason in skipped:
+              print(f"SKIPPED [{module}] {cls}.{name}: {reason}")
+          EOF
+
+      - name: Upload cxf-core jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxf-core
+          path: core/target/cxf-core-3.2.4.jar
+          if-no-files-found: error
