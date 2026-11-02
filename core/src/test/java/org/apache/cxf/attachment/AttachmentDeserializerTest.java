@@ -33,6 +33,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import javax.activation.DataSource;
+import javax.activation.URLDataSource;
 import javax.xml.parsers.SAXParser;
 import javax.xml.parsers.SAXParserFactory;
 
@@ -49,6 +50,8 @@ import org.apache.cxf.message.XMLMessage;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+
+import static org.hamcrest.CoreMatchers.instanceOf;
 
 public class AttachmentDeserializerTest extends Assert {
 
@@ -675,6 +678,48 @@ public class AttachmentDeserializerTest extends Assert {
         assertEquals(1249, count);
         assertEquals(-1, ins.read(new byte[1000], 100, 600));
         ins.close();
+    }
+
+    @Test
+    public void testCXF8706() {
+        final DataSource ds = AttachmentUtil
+            .getAttachmentDataSource("cid:http://image.com/1.gif", Collections.emptyList());
+        assertThat(ds, instanceOf(LazyDataSource.class));
+    }
+
+    @Test
+    public void testCXF8706followUrl() {
+        System.setProperty(AttachmentUtil.ATTACHMENT_XOP_FOLLOW_URLS_PROPERTY, "true");
+        try {
+            final DataSource ds = AttachmentUtil
+                .getAttachmentDataSource("cid:http://image.com/1.gif", Collections.emptyList());
+            assertThat(ds, instanceOf(URLDataSource.class));
+        } finally {
+            System.clearProperty(AttachmentUtil.ATTACHMENT_XOP_FOLLOW_URLS_PROPERTY);
+        }
+    }
+
+    @Test
+    public void testCXF8706BareUrlNotFollowed() {
+        // xop:Include href without the "cid:" scheme must never be dereferenced (SSRF / local file read)
+        DataSource ds = AttachmentUtil
+            .getAttachmentDataSource("http://image.com/1.gif", Collections.emptyList());
+        assertThat(ds, instanceOf(LazyDataSource.class));
+
+        ds = AttachmentUtil.getAttachmentDataSource("file:///etc/passwd", Collections.emptyList());
+        assertThat(ds, instanceOf(LazyDataSource.class));
+
+        ds = AttachmentUtil
+            .getAttachmentDataSource("cid:http%3A%2F%2Fimage.com%2F1.gif", Collections.emptyList());
+        assertThat(ds, instanceOf(LazyDataSource.class));
+
+        System.setProperty(AttachmentUtil.ATTACHMENT_XOP_FOLLOW_URLS_PROPERTY, "true");
+        try {
+            ds = AttachmentUtil.getAttachmentDataSource("http://image.com/1.gif", Collections.emptyList());
+            assertThat(ds, instanceOf(LazyDataSource.class));
+        } finally {
+            System.clearProperty(AttachmentUtil.ATTACHMENT_XOP_FOLLOW_URLS_PROPERTY);
+        }
     }
 }
 
